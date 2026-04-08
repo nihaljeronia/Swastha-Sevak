@@ -23,7 +23,12 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
-    app.include_router(webhook_router, prefix="/api/webhook", tags=["webhook"])
+    app.include_router(webhook_router, prefix="/webhook", tags=["webhook"])
+
+    @app.get("/")
+    async def root():
+        return {"message": "Swastha Sevak API", "status": "running"}
+
     return app
 
 
