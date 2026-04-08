@@ -1,1 +1,1 @@
-"""Agent graph and checkpoint orchestration.""
+"""Agent graph and checkpoint orchestration."""
