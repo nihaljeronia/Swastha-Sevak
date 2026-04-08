@@ -1,0 +1,35 @@
+[project]
+name = "swastha-sevak"
+version = "0.1.0"
+description = "Agentic AI medical triage chatbot for rural India"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.110.0",
+  "uvicorn[standard]>=0.23.0",
+  "sqlalchemy>=2.0.0",
+  "asyncpg>=0.28.0",
+  "httpx>=0.25.0",
+  "pydantic>=2.7.0",
+  "python-dotenv>=1.0.0",
+  "celery>=5.3.0",
+  "redis>=5.0.0",
+  "langchain>=0.0.300",
+  "langgraph>=0.1.0",
+  "xgboost>=1.7.0",
+  "faiss-cpu>=1.7.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.21.0",
+  "httpx>=0.25.0",
+  "pytest-mock>=3.11.0",
+  "asgi-lifespan>=1.0.0",
+  "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"

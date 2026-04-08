@@ -1,0 +1,1 @@
+"""Background task definitions and shared Celery configuration.""

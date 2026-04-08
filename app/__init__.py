@@ -1,0 +1,1 @@
+"""Swastha Sevak application package."""
