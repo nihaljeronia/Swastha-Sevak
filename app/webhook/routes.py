@@ -14,7 +14,13 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
-from app.webhook.service import process_incoming_message, save_outbound_message
+from app.nlp.models import NLPModelManager
+from app.webhook.service import (
+    compose_triage_reply,
+    process_incoming_message,
+    run_nlp_pipeline,
+    save_outbound_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,60 +53,124 @@ async def verify_webhook(request: Request) -> Response:
 
 
 @router.post("")
-async def receive_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-) -> dict[str, str]:
-    """Receive incoming WhatsApp messages from Meta webhook.
-
-    Returns 200 immediately, processes the message in a background task.
-    """
+async def receive_webhook(request: Request) -> dict[str, str]:
+    """Receive incoming WhatsApp messages from Meta webhook."""
     body = await request.json()
-    logger.info("WEBHOOK RECEIVED: %s", json.dumps(body, indent=2))
 
-    # Extract message data from Meta's nested structure
-    entry = body.get("entry", [])
-    if not entry:
-        return {"status": "ok"}
+    print("=" * 60)
+    print("WEBHOOK RAW BODY:")
+    print(json.dumps(body, indent=2))
+    print("=" * 60)
 
-    changes = entry[0].get("changes", [])
-    if not changes:
-        return {"status": "ok"}
+    try:
+        entry = body.get("entry", [])
+        print(f"ENTRY: {len(entry)} entries")
 
-    value = changes[0].get("value", {})
-    messages = value.get("messages")
+        if not entry:
+            print("NO ENTRY — returning")
+            return {"status": "ok"}
 
-    if not messages:
-        # Status update (delivered, read), not a message
-        return {"status": "ok"}
+        changes = entry[0].get("changes", [])
+        print(f"CHANGES: {len(changes)} changes")
 
-    message = messages[0]
-    sender_phone: str = message.get("from", "")
-    message_type: str = message.get("type", "text")
+        if not changes:
+            print("NO CHANGES — returning")
+            return {"status": "ok"}
 
-    # Determine content based on message type
-    if message_type == "text":
-        content = message.get("text", {}).get("body", "")
-    elif message_type == "audio":
-        content = f"[audio:{message.get('audio', {}).get('id', '')}]"
-    elif message_type == "interactive":
-        interactive = message.get("interactive", {})
-        content = (
-            interactive.get("button_reply", {}).get("id")
-            or interactive.get("list_reply", {}).get("id")
-            or ""
-        )
-    else:
-        content = f"[{message_type}]"
+        value = changes[0].get("value", {})
+        print(f"VALUE KEYS: {list(value.keys())}")
 
-    # Process in background so we return 200 immediately to Meta
-    background_tasks.add_task(
-        _process_and_reply,
-        sender_phone,
-        message_type,
-        content,
-        body,
-    )
+        messages = value.get("messages")
+        print(f"MESSAGES: {messages}")
+
+        if not messages:
+            print("NO MESSAGES — this is a status update, not a user message")
+            return {"status": "ok"}
+
+        message = messages[0]
+        sender_phone = message.get("from")
+        message_type = message.get("type")
+        print(f"SENDER: {sender_phone}, TYPE: {message_type}")
+
+        # Determine content based on message type
+        if message_type == "text":
+            content = message.get("text", {}).get("body", "")
+        elif message_type == "audio":
+            content = f"[audio:{message.get('audio', {}).get('id', '')}]"
+        elif message_type == "interactive":
+            interactive = message.get("interactive", {})
+            content = (
+                interactive.get("button_reply", {}).get("id")
+                or interactive.get("list_reply", {}).get("id")
+                or ""
+            )
+        else:
+            content = f"[{message_type}]"
+
+        print(f"CONTENT: {content}")
+
+        # --- DB: persist inbound message ---
+        print("SAVING to database...")
+        async with AsyncSessionLocal() as session:
+            patient, msg = await process_incoming_message(
+                session=session,
+                phone=sender_phone,
+                message_type=message_type,
+                content=content,
+                raw_payload=body,
+            )
+            print(f"DB SAVED: patient={patient.id}, message={msg.id}")
+
+            # --- NLP pipeline (text only) ---
+            triage_session_id = None
+            if message_type == "text" and content:
+                print("RUNNING NLP pipeline...")
+                nlp_manager = request.app.state.nlp_manager
+                nlp_result = await run_nlp_pipeline(
+                    session=session,
+                    patient=patient,
+                    nlp_manager=nlp_manager,
+                    text=content,
+                )
+                triage_session_id = nlp_result["triage_session_id"]
+                print(f"NLP RESULT: lang={nlp_result['language']}, "
+                      f"symptoms={nlp_result['all_symptoms']}, "
+                      f"session={triage_session_id}")
+                reply_text = await compose_triage_reply(nlp_result, nlp_manager)
+            elif message_type == "audio":
+                reply_text = (
+                    "Voice note received! Automatic transcription is coming soon. "
+                    "For now, please type your symptoms."
+                )
+            elif message_type == "interactive":
+                reply_text = (
+                    f"You selected: {content}. "
+                    "Please tell me more about your symptoms."
+                )
+            else:
+                reply_text = f"Received your {message_type} message."
+
+            print(f"REPLY TEXT: {reply_text}")
+
+            # --- Send reply via Meta API ---
+            print("CALLING send_reply...")
+            await send_reply(sender_phone, reply_text)
+            print("send_reply COMPLETED")
+
+            # --- DB: persist outbound message ---
+            print("SAVING outbound message...")
+            await save_outbound_message(
+                session=session,
+                patient_id=patient.id,
+                content=reply_text,
+                session_id=triage_session_id,
+            )
+            print(f"DB SAVED outbound reply for patient {patient.id}")
+
+    except Exception as e:
+        import traceback
+        print(f"ERROR: {e}")
+        print(traceback.format_exc())
 
     return {"status": "ok"}
 
@@ -115,11 +185,12 @@ async def _process_and_reply(
     message_type: str,
     content: str,
     raw_payload: dict,
+    nlp_manager: NLPModelManager,
 ) -> None:
-    """Background task: persist message to DB, then send echo reply."""
+    """Background task: persist message, run NLP pipeline, send reply."""
     try:
         async with AsyncSessionLocal() as session:
-            # 1. Persist inbound message
+            # 1. Persist inbound message (and get/create Patient record)
             patient, msg = await process_incoming_message(
                 session=session,
                 phone=sender_phone,
@@ -134,24 +205,39 @@ async def _process_and_reply(
                 sender_phone,
             )
 
-            # 2. Compose reply (echo for now — will be replaced by agent)
-            if message_type == "text":
-                reply_text = f"You said: {content}"
+            # 2. Run NLP pipeline on text messages; stubs for other types
+            triage_session_id = None
+            if message_type == "text" and content:
+                nlp_result = await run_nlp_pipeline(
+                    session=session,
+                    patient=patient,
+                    nlp_manager=nlp_manager,
+                    text=content,
+                )
+                triage_session_id = nlp_result["triage_session_id"]
+                reply_text = await compose_triage_reply(nlp_result, nlp_manager)
             elif message_type == "audio":
-                reply_text = "Voice note received! (processing coming soon)"
+                reply_text = (
+                    "Voice note received! Automatic transcription is coming soon. "
+                    "For now, please type your symptoms."
+                )
             elif message_type == "interactive":
-                reply_text = f"You selected: {content}"
+                reply_text = (
+                    f"You selected: {content}. "
+                    "Please tell me more about your symptoms."
+                )
             else:
                 reply_text = f"Received your {message_type} message."
 
             # 3. Send reply via Meta API
             await _send_whatsapp_reply(sender_phone, reply_text)
 
-            # 4. Persist outbound message
+            # 4. Persist outbound message (linked to triage session if available)
             await save_outbound_message(
                 session=session,
                 patient_id=patient.id,
                 content=reply_text,
+                session_id=triage_session_id,
             )
             logger.info("Saved outbound reply to patient %s", patient.id)
 
@@ -164,16 +250,21 @@ async def _process_and_reply(
 # ---------------------------------------------------------------------------
 
 
-async def _send_whatsapp_reply(to: str, text: str) -> None:
+async def send_reply(to: str, text: str) -> None:
     """Send a text message back to the user via Meta Cloud API."""
-    url = (
-        f"https://graph.facebook.com/v21.0/"
-        f"{settings.meta_phone_number_id}/messages"
-    )
+    phone_number_id = settings.meta_phone_number_id
+    access_token = settings.meta_access_token
+
+    print(f"SEND_REPLY: to={to}, phone_number_id={phone_number_id}")
+    print(f"SEND_REPLY: token starts with: {access_token[:20] if access_token else 'NONE'}...")
+
+    url = f"https://graph.facebook.com/v21.0/{phone_number_id}/messages"
+
     headers = {
-        "Authorization": f"Bearer {settings.meta_access_token}",
+        "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
     }
+
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -183,4 +274,4 @@ async def _send_whatsapp_reply(to: str, text: str) -> None:
 
     async with httpx.AsyncClient() as client:
         response = await client.post(url, json=payload, headers=headers)
-        logger.info("SEND REPLY status=%s: %s", response.status_code, response.text)
+        print(f"SEND_REPLY RESPONSE: status={response.status_code}, body={response.text}")
