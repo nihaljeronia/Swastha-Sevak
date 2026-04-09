@@ -9,6 +9,8 @@ import time
 import json
 from pathlib import Path
 import os
+import torch
+
 
 class IndicWhisperTester:
     def __init__(self):
@@ -37,7 +39,7 @@ class IndicWhisperTester:
             str(audio_path),
             language=language,
             verbose=False,
-            fp16=True  
+            fp16=torch.cuda.is_available()  
         )
         
         elapsed = time.time() - start
@@ -133,6 +135,16 @@ if __name__ == "__main__":
         json.dump(results, f, ensure_ascii=False, indent=2)
         print(f"\n GPU-Usage: {results[0].get('gpu_usage', 'N/A') if results else 'N/A'}%")
         print(f"Results saved to {output_file}")
+
+
+def check_gpu():
+    print(torch.cuda.is_available())
+    print(next(model.parameters()).is_cuda)
+    tester= IndicWhisperTester()
+    tester.test_language_detection()
+    print(next(model.parameters()).is_cuda)
+    device= next(self.model.parameters()).device
+    print(device)
 
 
 
