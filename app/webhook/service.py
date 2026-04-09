@@ -150,19 +150,19 @@ async def compose_triage_reply(
 ) -> str:
     """Compose a conversational triage reply in the patient's language.
 
-    Keeps the bot helpful for Step 3 before the LangGraph agent (Step 4)
-    takes over the full conversation loop.
-
     Logic:
     - No symptoms found     → greet and ask the patient to describe their problem.
     - 1–2 symptoms found    → acknowledge and ask for more detail / duration.
-    - 3+ symptoms collected → acknowledge and inform that analysis is in progress.
+    - 3+ symptoms collected → run classifier and return real triage response.
 
     The English response is translated to the patient's detected language before
     being returned.
     """
+    from app.ml.classifier import predict_from_text
+
     language = nlp_result["language"]
     all_symptoms: list[str] = nlp_result["all_symptoms"]
+    english_text = nlp_result.get("english_text", "")
 
     if not all_symptoms:
         english_reply = (
@@ -178,11 +178,58 @@ async def compose_triage_reply(
             "and is there anything else troubling you?"
         )
     else:
-        names = ", ".join(s.replace("_", " ") for s in all_symptoms)
+        # Run the classifier for real triage
+        result = predict_from_text(english_text, all_symptoms)
+        urgency = result.get("urgency", "routine")
+        conditions = result.get("conditions", [])
+        mapped = result.get("mapped_symptoms", all_symptoms)
+
+        urgency_emoji = {
+            "self_care": "\U0001f7e2",
+            "routine": "\U0001f7e1",
+            "urgent": "\U0001f7e0",
+            "emergency": "\U0001f534",
+        }
+        urgency_advice = {
+            "self_care": "You can manage this at home with rest and fluids.",
+            "routine": "Please visit a doctor soon.",
+            "urgent": "Please visit your nearest health center today.",
+            "emergency": "GO TO THE NEAREST HOSPITAL IMMEDIATELY! Call 108 for ambulance!",
+        }
+
+        emoji = urgency_emoji.get(urgency, "\U0001f7e1")
+        advice = urgency_advice.get(urgency, "Please consult a doctor.")
+        symptom_names = ", ".join(s.replace("_", " ") for s in mapped) if mapped else ", ".join(s.replace("_", " ") for s in all_symptoms)
+
+        # Format top condition
+        condition_line = ""
+        if conditions:
+            top = conditions[0]
+            confidence_pct = int(top["confidence"] * 100)
+            condition_line = f"\nPossible condition: {top['name']} ({confidence_pct}% confidence)"
+
         english_reply = (
-            f"Thank you. I have noted your symptoms: {names}. "
-            "I am analysing your condition. "
-            "If this is an emergency, please call 108 immediately."
+            f"{emoji} *Swastha Sevak Triage*\n\n"
+            f"Your symptoms: {symptom_names}\n"
+            f"{condition_line}\n\n"
+            f"Urgency: *{urgency.upper()}*\n"
+            f"{advice}\n\n"
+        )
+
+        if urgency in ("urgent", "emergency"):
+            english_reply += (
+                "Nearest: Community Health Center, Bhopal Road\n"
+                "Phone: 0755-XXXXXXX\n"
+                "Ambulance: 108\n\n"
+            )
+
+        english_reply += "This is an AI-based preliminary assessment, not a replacement for a doctor. Please consult a doctor."
+
+        logger.info(
+            "Triage result: urgency=%s conditions=%s symptoms=%s",
+            urgency,
+            [c["name"] for c in conditions[:3]],
+            mapped,
         )
 
     if language == "en":

@@ -1,7 +1,7 @@
 """WhatsApp webhook routes.
 
 - GET  /webhook — Meta verification (returns hub.challenge)
-- POST /webhook — Receives messages, persists them, sends echo reply
+- POST /webhook — Receives messages, persists them, runs triage, sends reply
 """
 
 from __future__ import annotations
@@ -122,8 +122,9 @@ async def receive_webhook(request: Request) -> dict[str, str]:
                 reply_text = await compose_triage_reply(nlp_result, nlp_manager)
             elif message_type == "audio":
                 reply_text = (
-                    "Voice note received! Automatic transcription is coming soon. "
-                    "For now, please type your symptoms."
+                    "\U0001f3a4 Voice note mila! Abhi hum sirf text samajh sakte hain.\n\n"
+                    "Kripya apne lakshan Hindi ya English mein type karein.\n\n"
+                    "Example: mujhe bukhar hai aur sir me dard hai"
                 )
             elif message_type == "interactive":
                 reply_text = (
