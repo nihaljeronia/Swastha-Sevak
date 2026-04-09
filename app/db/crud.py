@@ -221,3 +221,34 @@ async def update_alert_status(
     await session.commit()
     await session.refresh(alert)
     return alert
+
+
+# ---------------------------------------------------------------------------
+# PHC Lookup (Primary Health Centers)
+# ---------------------------------------------------------------------------
+
+
+def get_nearest_phc(patient_phone: str) -> dict | None:
+    """Find the nearest Primary Health Center for a patient.
+
+    Placeholder implementation — will integrate with geolocation
+    and PHC database once location tracking is available.
+
+    Args:
+        patient_phone: Patient's WhatsApp phone number.
+
+    Returns:
+        Dict with PHC info: {"name": str, "distance_km": float, "phone": str}
+        or None if no PHC found.
+    """
+    # TODO: Implement with:
+    # 1. Patient's location (from previous messages or location sharing)
+    # 2. PHC database with lat/lon
+    # 3. Distance calculation (Haversine formula)
+    # Currently returns mock data for testing
+    return {
+        "name": "Primary Health Center, Raisen Road",
+        "distance_km": 8.5,
+        "phone": "07482-XXXXXX",
+        "address": "Raisen Road, Bhopāl",
+    }

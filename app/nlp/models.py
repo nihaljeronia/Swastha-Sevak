@@ -120,3 +120,77 @@ class NLPModelManager:
         Delegates to :func:`app.nlp.ner.extract_medical_entities`.
         """
         return extract_medical_entities(english_text)
+
+
+# ============================================================================
+# Module-level helper functions for agent nodes (with mock support)
+# ============================================================================
+
+import os
+
+USE_MOCK_NLP = os.getenv("MOCK_NLP", "false").lower() in ("true", "1", "yes")
+
+
+def process_message(text: str) -> tuple[list[str], dict]:
+    """Extract symptoms and medical entities from text.
+
+    Args:
+        text: Input message text (preferably in English).
+
+    Returns:
+        Tuple of (symptoms_list, entities_dict).
+        Entities dict structure: {"body_parts": [...], "duration": [...], "severity": [...]}.
+    """
+    if USE_MOCK_NLP:
+        logger.info("[process_message] MOCK: extracting hardcoded symptoms")
+        mock_symptoms = ["fever", "cough"]
+        mock_entities = {
+            "body_parts": ["chest"],
+            "duration": ["3 days"],
+            "severity": ["moderate"],
+        }
+        return mock_symptoms, mock_entities
+
+    # Use the actual extraction logic
+    logger.info("[process_message] Extracting symptoms via NER")
+    entities = extract_medical_entities(text)
+    symptoms = entities.get("symptoms", [])
+    return symptoms, entities
+
+
+def translate_to_en(text: str, source_lang: str) -> str:
+    """Translate text to English from source language.
+
+    Args:
+        text: Input text.
+        source_lang: Source language code ('hi', 'ta', 'mr', etc.).
+
+    Returns:
+        English translation of text.
+    """
+    if USE_MOCK_NLP:
+        logger.info(f"[translate_to_en] MOCK: pretending to translate from {source_lang}")
+        return text
+
+    # Real implementation via translator
+    logger.info(f"[translate_to_en] Translating from {source_lang} to English")
+    return to_english(text, source_lang)
+
+
+def translate_to_patient_lang(text: str, target_lang: str) -> str:
+    """Translate text to patient's language from English.
+
+    Args:
+        text: Input text in English.
+        target_lang: Target language code ('hi', 'ta', 'mr', etc.).
+
+    Returns:
+        Translated text in target language.
+    """
+    if USE_MOCK_NLP:
+        logger.info(f"[translate_to_patient_lang] MOCK: pretending to translate to {target_lang}")
+        return f"{text}\n[{target_lang}]"
+
+    # Real implementation via translator
+    logger.info(f"[translate_to_patient_lang] Translating to {target_lang}")
+    return from_english(text, target_lang)
