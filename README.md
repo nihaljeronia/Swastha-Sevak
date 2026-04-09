@@ -3,7 +3,7 @@
 Agentic AI medical triage chatbot scaffold for rural India.
 
 ## What has been done so far
-a
+
 - Created the initial FastAPI scaffold with async startup lifespan.
 - Added `app/core/config.py` for Pydantic settings and database configuration.
 - Added `app/db/` with SQLAlchemy async session, database models, and CRUD stubs.

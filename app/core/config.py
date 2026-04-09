@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     app_name: str = "Swastha Sevak"
     environment: str = "development"
     database_url: str = Field(
-        "postgresql+asyncpg://sahayak:yourpassword@localhost:5432/swasthya_sahayak",
+        "postgresql+asyncpg://postgres:yourpassword@127.0.0.1:5432/swasthya_sahayak",
         env="DATABASE_URL",
     )
     whatsapp_api_url: str = Field("", env="WHATSAPP_API_URL")

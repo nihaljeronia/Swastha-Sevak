@@ -41,6 +41,3 @@ build/
 dist/
 *.egg-info/
 .eggs/
-
-#for the model testing 
-tests/asr_results.json
