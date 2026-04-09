@@ -32,7 +32,7 @@ class NLPModelManager:
     Loaded once at startup via FastAPI lifespan; shared across all requests
     through ``app.state.nlp_manager``.
     """
-
+    
     def __init__(self) -> None:
         self.stt_model: Any | None = None
         self.language_model: str | None = None
@@ -40,22 +40,35 @@ class NLPModelManager:
         self._loaded: bool = False
 
     async def load_models(self) -> None:
-        """Register all NLP model handles at application startup.
-
-        v1 uses libraries that require no model downloads.
-        Heavy models (IndicWhisper, MuRIL, IndicTrans2) are stubbed
-        until GPU resources and model weights are available.
-        """
+        """Register all NLP model handles at application startup."""
         self.language_model = "langdetect-v1"
         self.translation_model = "google-translate-v1"
-        # TODO: load IndicWhisper when GPU / model weights are available:
-        #   from app.nlp.asr import load_indicwhisper
-        #   self.stt_model = await load_indicwhisper()
+        
+        # Load whisper small using the main thread directly natively (bypassing HF)
+        try:
+            import whisper
+            import torch
+            import os
+            
+            # Using the small architecture natively
+            model_id = os.getenv("INDICWHISPER_MODEL", "small")
+            logger.info(f"Loading native Whisper model: '{model_id}'...")
+            
+            self.stt_model = whisper.load_model(model_id)
+                
+        except ImportError:
+            logger.warning("native 'whisper' library missing! ASR will not work.")
+            self.stt_model = None
+        except Exception as e:
+            logger.error(f"Could not load native whisper: {e}")
+            self.stt_model = None
+            
         self._loaded = True
         logger.info(
-            "NLP models ready — language=%s, translation=%s, ASR=stub",
+            "NLP models ready — language=%s, translation=%s, ASR=%s",
             self.language_model,
             self.translation_model,
+            "Native Whisper (Loaded)" if self.stt_model else "Missing",
         )
 
     async def shutdown(self) -> None:
@@ -69,11 +82,7 @@ class NLPModelManager:
     # ── Language detection ────────────────────────────────────────────────────
 
     def detect_language(self, text: str) -> str:
-        """Return an ISO 639-1 language code for *text*.
-
-        Delegates to :func:`app.nlp.language_id.detect_language`.
-        Falls back to ``"hi"`` (Hindi) on short text or low confidence.
-        """
+        """Return an ISO 639-1 language code for *text*."""
         return detect_language(text)
 
     # ── Speech-to-text ────────────────────────────────────────────────────────
@@ -83,17 +92,44 @@ class NLPModelManager:
         audio_bytes: bytes,
         source_language: str | None = None,
     ) -> str:
-        """Transcribe audio bytes to text.
-
-        TODO: Implement with AI4Bharat IndicWhisper (22 Indian languages).
-        Returns an empty string until the model is loaded.
-        """
-        logger.warning(
-            "ASR not yet implemented (IndicWhisper stub) — "
-            "returning empty transcript for %d-byte audio.",
-            len(audio_bytes),
-        )
-        return ""
+        """Transcribe audio directly using local native Whisper model."""
+        if not self.stt_model:
+            logger.warning("ASR failed: Native Whisper model is not loaded.")
+            return ""
+            
+        import tempfile
+        import os
+        import torch
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+            
+        try:
+            loop = asyncio.get_running_loop()
+            
+            def _do_transcribe():
+                # Whisper handles parsing internally, no librosa needed
+                result = self.stt_model.transcribe(
+                    tmp_path, 
+                    language=source_language, 
+                    fp16=torch.cuda.is_available()
+                )
+                return result.get("text", "").strip()
+                
+            text = await loop.run_in_executor(None, _do_transcribe)
+            
+            logger.info("Transcribed voice note to: %r", text[:60])
+            return text
+        except Exception:
+            logger.exception("Native Whisper Transcribe failed")
+            return ""
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     # ── Translation ───────────────────────────────────────────────────────────
 
@@ -120,3 +156,33 @@ class NLPModelManager:
         Delegates to :func:`app.nlp.ner.extract_medical_entities`.
         """
         return extract_medical_entities(english_text)
+
+    # ── Text to Speech (TTS) ──────────────────────────────────────────────────
+
+    async def text_to_speech(self, text: str, language: str) -> bytes:
+        """Convert final text response back into regional audio bytes via gTTS."""
+        import tempfile
+        import os
+        from gtts import gTTS
+        
+        # Determine language mappings, fallback to hindi
+        lang_map = {"hi": "hi", "ta": "ta", "te": "te", "mr": "mr", "bn": "bn", "gu": "gu", "en": "en"}
+        tts_lang = lang_map.get(language, "hi")
+        
+        try:
+            loop = asyncio.get_running_loop()
+            def _tts():
+                tts = gTTS(text=text, lang=tts_lang)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+                    temp_path = fp.name
+                # Save requires a named path
+                tts.save(temp_path)
+                with open(temp_path, "rb") as audio_file:
+                    audio_data = audio_file.read()
+                os.remove(temp_path)
+                return audio_data
+                
+            return await loop.run_in_executor(None, _tts)
+        except Exception:
+            logger.exception("TTS Failed")
+            return b""

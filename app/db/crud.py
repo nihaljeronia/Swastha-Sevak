@@ -107,6 +107,22 @@ async def save_message(
     return message
 
 
+async def get_messages_for_session(
+    session: AsyncSession,
+    session_id: uuid.UUID,
+    limit: int = 10,
+) -> list[Message]:
+    """Fetch recent messages for a triage session to build chat memory context."""
+    stmt = (
+        select(Message)
+        .where(Message.session_id == session_id)
+        .order_by(Message.created_at.asc())
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
 # ---------------------------------------------------------------------------
 # TriageSession
 # ---------------------------------------------------------------------------

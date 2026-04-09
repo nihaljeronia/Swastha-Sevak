@@ -66,127 +66,148 @@ async def save_outbound_message(
     return message
 
 
-async def run_nlp_pipeline(
+async def run_triage_agent(
     session: AsyncSession,
     patient: Patient,
-    nlp_manager: NLPModelManager,
     text: str,
 ) -> dict[str, Any]:
-    """Run the full NLP pipeline on an incoming patient text message.
+    """Run the TriageAgent (LangGraph) on an incoming patient text message.
 
     Steps:
-    1. Detect language.
-    2. Persist detected language on the Patient record (first message only).
-    3. Translate to English for NER.
-    4. Extract medical entities (symptoms, duration, severity).
-    5. Get or create an active TriageSession.
-    6. Accumulate new symptoms and entities into the session.
-
-    Returns:
-        Dict with keys: language, english_text, entities,
-        triage_session_id, all_symptoms, is_new_session.
+    1. Get or create an active TriageSession from the database.
+    2. Hydrate the LangGraph agent's state with the existing DB session.
+    3. Execute the Multi-Agent loop to process NLP, predict urgency, and compose reply.
+    4. Save updated conditions back into the PostgreSQL DB.
     """
-    # 1. Detect language
-    language = nlp_manager.detect_language(text)
-    logger.info("Detected language=%s for patient=%s", language, patient.id)
+    from app.agents.graph import TriageAgent
 
-    # 2. Persist language preference (only when first recorded)
-    if not patient.language:
-        await crud.update_patient(session, patient.id, language=language)
-
-    # 3. Translate to English for downstream NER
-    if language == "en":
-        english_text = text
-    else:
-        english_text = await nlp_manager.translate_to_english(text, language)
-        logger.info("Translated to English: %r", english_text[:80])
-
-    # 4. Extract medical entities from English text
-    entities = nlp_manager.extract_entities(english_text)
-
-    # 5. Get or create the active triage session
+    # 1. Get or create the active triage session
     triage = await crud.get_active_triage_session(session, patient.id)
-    is_new_session = triage is None
     if triage is None:
         triage = await crud.create_triage_session(session, patient.id)
 
-    # 6. Merge new symptoms (avoid duplicates) and update entities
-    existing_symptoms: list[str] = list(triage.symptoms or [])
-    new_symptoms = [s for s in entities["symptoms"] if s not in existing_symptoms]
-    all_symptoms = existing_symptoms + new_symptoms
+    # 2. Fetch conversational context
+    past_messages = await crud.get_messages_for_session(session, triage.id)
+    formatted_messages = []
+    for msg in past_messages:
+        # Ignore the current inbound message being processed right now since we append it later
+        if msg.content == text and msg.direction == "inbound":
+            continue
+        role = "user" if msg.direction == "inbound" else "assistant"
+        formatted_messages.append({"role": role, "content": msg.content or ""})
 
-    existing_entities: dict[str, Any] = dict(triage.medical_entities or {})
-    if entities.get("duration"):
-        existing_entities["duration"] = entities["duration"]
-    if entities.get("severity"):
-        existing_entities["severity"] = entities["severity"]
-
+    # 3. Setup the LangGraph agent
+    agent = TriageAgent()
+    await agent.load_model()
+    
+    # Hydrate LangGraph State from Postgres
+    agent.checkpoint["state"] = {
+        "patient_phone": patient.phone,
+        "language": patient.language or "en",
+        "symptoms": list(triage.symptoms or []),
+        "medical_entities": dict(triage.medical_entities or {}),
+        "question_count": len(triage.symptoms or []),
+        "messages": formatted_messages,
+    }
+    
+    # 3. Process the new message using the Agent Graph
+    patient_data = {
+        "phone": patient.phone,
+        "message": text
+    }
+    result = await agent.run(patient_data)
+    
+    final_state = result["state"]
+    new_symptoms = final_state.get("symptoms", [])
+    new_entities = final_state.get("medical_entities", {})
+    urgency = final_state.get("urgency", "routine")
+    detected_language = final_state.get("language", "en")
+    
+    # Update language preference if newly detected
+    if not patient.language and detected_language != "en":
+        await crud.update_patient(session, patient.id, language=detected_language)
+        
+    session_completed = final_state.get("session_completed", False)
+    status_flag = "completed" if session_completed else "in_progress"
+    
+    # 4. Save updated state back to DB
+    from datetime import datetime
     await crud.update_triage_session(
         session,
         triage.id,
-        symptoms=all_symptoms,
-        medical_entities=existing_entities,
+        symptoms=new_symptoms,
+        medical_entities=new_entities,
+        urgency=urgency,
+        status=status_flag,
+        completed_at=datetime.utcnow() if session_completed else None
     )
+    
+    # Automatically execute LLM summarization and insert into final summary tables
+    if session_completed:
+        import os
+        from app.db.models import ConversationSummary
+        if os.getenv("OPENAI_API_KEY"):
+            from langchain_openai import ChatOpenAI
+            from langchain_core.prompts import ChatPromptTemplate
+            from pydantic import BaseModel, Field
+            
+            class SummaryOutput(BaseModel):
+                topic: str = Field(description="A short 2-3 word topic name (e.g. 'Viral Fever Intake')")
+                summary: str = Field(description="A 3-sentence clinical summary of the whole conversation, symptoms, duration, and diagnosis.")
+                
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+            chain = ChatPromptTemplate.from_template("Summarize this clinical conversation:\n{history}") | llm.with_structured_output(SummaryOutput)
+            
+            history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in formatted_messages])
+            try:
+                res = await chain.ainvoke({"history": history_str})
+                summary_record = ConversationSummary(patient_id=patient.id, session_id=triage.id, topic=res.topic, summary_text=res.summary)
+                session.add(summary_record)
+                await session.commit()
+                logger.info(f"Generated Session Summary successfully: {res.topic}")
+            except Exception as e:
+                logger.error(f"Failed to generate summary: {e}")
+        else:
+            # Fallback
+            summary_record = ConversationSummary(patient_id=patient.id, session_id=triage.id, topic=urgency.capitalize(), summary_text="System finalized diagnosis without LLM.")
+            session.add(summary_record)
+            await session.commit()
+            
     logger.info(
-        "Session %s updated — symptoms=%s entities=%s",
+        "Agent finished session %s [STATUS: %s] — symptoms=%s urgency=%s",
         triage.id,
-        all_symptoms,
-        existing_entities,
+        status_flag,
+        new_symptoms,
+        urgency,
     )
 
     return {
-        "language": language,
-        "english_text": english_text,
-        "entities": entities,
         "triage_session_id": triage.id,
-        "all_symptoms": all_symptoms,
-        "is_new_session": is_new_session,
+        "reply_text": result.get("reply", "I am having trouble understanding. Please try again.")
     }
 
 
-async def compose_triage_reply(
-    nlp_result: dict[str, Any],
-    nlp_manager: NLPModelManager,
-) -> str:
-    """Compose a conversational triage reply in the patient's language.
+async def download_media(media_id: str) -> bytes:
+    """Download encrypted media binary from Meta WhatsApp API."""
+    import httpx
+    from app.core.config import settings
 
-    Keeps the bot helpful for Step 3 before the LangGraph agent (Step 4)
-    takes over the full conversation loop.
-
-    Logic:
-    - No symptoms found     → greet and ask the patient to describe their problem.
-    - 1–2 symptoms found    → acknowledge and ask for more detail / duration.
-    - 3+ symptoms collected → acknowledge and inform that analysis is in progress.
-
-    The English response is translated to the patient's detected language before
-    being returned.
-    """
-    language = nlp_result["language"]
-    all_symptoms: list[str] = nlp_result["all_symptoms"]
-
-    if not all_symptoms:
-        english_reply = (
-            "Hello! I am Swastha Sevak, your health assistant. "
-            "Please describe what you are feeling — fever, pain, cough, "
-            "or any other symptom."
+    headers = {"Authorization": f"Bearer {settings.meta_access_token}"}
+    async with httpx.AsyncClient() as client:
+        # Step 1: Query the Graph API for the private media URL
+        metadata_res = await client.get(
+            f"https://graph.facebook.com/v21.0/{media_id}",
+            headers=headers,
         )
-    elif len(all_symptoms) < 3:
-        names = ", ".join(s.replace("_", " ") for s in all_symptoms)
-        english_reply = (
-            f"I understand you have: {names}. "
-            "Can you tell me more? How long have you had these symptoms, "
-            "and is there anything else troubling you?"
-        )
-    else:
-        names = ", ".join(s.replace("_", " ") for s in all_symptoms)
-        english_reply = (
-            f"Thank you. I have noted your symptoms: {names}. "
-            "I am analysing your condition. "
-            "If this is an emergency, please call 108 immediately."
-        )
+        metadata_res.raise_for_status()
+        
+        media_url = metadata_res.json().get("url")
+        if not media_url:
+            raise ValueError("Media URL not found in Graph API response.")
+            
+        # Step 2: Download the raw bytes using the same Bearer token
+        media_res = await client.get(media_url, headers=headers)
+        media_res.raise_for_status()
+        
+        return media_res.content
 
-    if language == "en":
-        return english_reply
-
-    translated = await nlp_manager.translate_from_english(english_reply, language)
-    return translated

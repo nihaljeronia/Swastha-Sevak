@@ -151,3 +151,30 @@ class Alert(Base):
 
     def __repr__(self) -> str:
         return f"<Alert id={self.id} type={self.alert_type} status={self.status}>"
+
+
+class ConversationSummary(Base):
+    """Historical compressed summaries of completely finalized triage sessions."""
+
+    __tablename__ = "conversation_summaries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    patient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("patients.id"), nullable=False, index=True
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("triage_sessions.id"), nullable=False, unique=True
+    )
+    topic: Mapped[str] = mapped_column(String(128), nullable=False)
+    summary_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    # Relationships
+    patient: Mapped[Patient] = relationship() # Add dynamic relation
+
+    def __repr__(self) -> str:
+        return f"<ConversationSummary id={self.id} topic={self.topic}>"

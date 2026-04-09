@@ -14,9 +14,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.webhook.service import (
-    compose_triage_reply,
     process_incoming_message,
-    run_nlp_pipeline,
+    run_triage_agent,
     save_outbound_message,
 )
 
@@ -102,29 +101,31 @@ async def receive_webhook(request: Request) -> dict[str, str]:
             )
             logger.info("Saved inbound message=%s patient=%s", msg.id, patient.id)
 
-            # --- NLP pipeline (text only) ---
             triage_session_id = None
-            if message_type == "text" and content:
-                nlp_manager = request.app.state.nlp_manager
-                nlp_result = await run_nlp_pipeline(
+            if message_type in ("text", "audio"):
+                from app.webhook.service import run_triage_agent, download_media
+                
+                # Automatically transcribe voice notes
+                if message_type == "audio":
+                    audio_id = message.get("audio", {}).get("id")
+                    audio_bytes = await download_media(audio_id)
+                    nlp_manager = request.app.state.nlp_manager
+                    
+                    # Assuming we know patient lang, or whisper auto-detects
+                    content = await nlp_manager.transcribe(audio_bytes, source_language=patient.language)
+                    
+                    if not content:
+                        # Fallback natively if missing or bad transcription
+                        content = "(System: Transcribing voice note failed. The patient sent audio but it could not be understood.)"
+
+                # Run unified intelligent multi-agent pipeline using Transcribed or Text Content
+                result = await run_triage_agent(
                     session=session,
                     patient=patient,
-                    nlp_manager=nlp_manager,
                     text=content,
                 )
-                triage_session_id = nlp_result["triage_session_id"]
-                logger.info(
-                    "NLP: lang=%s symptoms=%s session=%s",
-                    nlp_result["language"],
-                    nlp_result["all_symptoms"],
-                    triage_session_id,
-                )
-                reply_text = await compose_triage_reply(nlp_result, nlp_manager)
-            elif message_type == "audio":
-                reply_text = (
-                    "Voice note received! Automatic transcription is coming soon. "
-                    "For now, please type your symptoms."
-                )
+                triage_session_id = result["triage_session_id"]
+                reply_text = result["reply_text"]
             elif message_type == "interactive":
                 reply_text = (
                     f"You selected: {content}. "
@@ -133,7 +134,18 @@ async def receive_webhook(request: Request) -> dict[str, str]:
             else:
                 reply_text = f"Received your {message_type} message."
 
-            # --- Send reply via Meta API ---
+            # --- Generate & Send Audio Reply via Meta API ---
+            # Automatically parse the response and natively encode back into localized TTS dialects!
+            audio_bytes = await request.app.state.nlp_manager.text_to_speech(reply_text, patient.language or "hi")
+            if audio_bytes:
+                try:
+                    media_id = await upload_audio_to_meta(audio_bytes)
+                    if media_id:
+                        await send_audio_reply(sender_phone, media_id)
+                except Exception as e:
+                    logger.error("Failed to push audio via Meta: %s", e)
+
+            # --- Send Text Reply via Meta API ---
             await send_reply(sender_phone, reply_text)
 
             # --- DB: persist outbound message ---
@@ -152,8 +164,41 @@ async def receive_webhook(request: Request) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# WhatsApp reply helper
+# WhatsApp reply helper & Audio upload
 # ---------------------------------------------------------------------------
+
+
+async def upload_audio_to_meta(audio_bytes: bytes) -> str:
+    """Upload TTS audio binary to Meta Graph and retain the server Media ID."""
+    url = f"https://graph.facebook.com/v21.0/{settings.meta_phone_number_id}/media"
+    headers = {"Authorization": f"Bearer {settings.meta_access_token}"}
+    files = {
+        'file': ('audio.mp3', audio_bytes, 'audio/mpeg'),
+        'type': (None, 'audio'),
+        'messaging_product': (None, 'whatsapp')
+    }
+    async with httpx.AsyncClient() as client:
+        res = await client.post(url, headers=headers, files=files)
+        res.raise_for_status()
+        return res.json().get("id")
+
+
+async def send_audio_reply(to: str, media_id: str) -> None:
+    """Dispatch Meta Media Asset out to the client natively."""
+    url = f"https://graph.facebook.com/v21.0/{settings.meta_phone_number_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {settings.meta_access_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "audio",
+        "audio": {"id": media_id},
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, headers=headers)
+        logger.info("Audio Reply to=%s status=%s", to, response.status_code)
 
 
 async def send_reply(to: str, text: str) -> None:
@@ -175,5 +220,5 @@ async def send_reply(to: str, text: str) -> None:
 
     async with httpx.AsyncClient() as client:
         response = await client.post(url, json=payload, headers=headers)
-        logger.info("Reply to=%s status=%s", to, response.status_code)
+        logger.info("Text Reply to=%s status=%s", to, response.status_code)
 

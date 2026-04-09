@@ -16,9 +16,11 @@ async def lifespan(app: FastAPI):
     app.state.classifier = DiseaseClassifier()
     await app.state.classifier.load_model()
     app.state.agent = TriageAgent()
+    await app.state.agent.load_model()
     yield
     await app.state.nlp_manager.shutdown()
     await app.state.classifier.shutdown()
+    await app.state.agent.shutdown()
 
 
 def create_app() -> FastAPI:
